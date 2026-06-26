@@ -8,7 +8,7 @@ import {
 } from "@zxing/browser";
 import { DecodeHintType } from "@zxing/library";
 
-type SaveState = "idle" | "saving" | "saved" | "error";
+type SaveState = "idle" | "ready" | "saving" | "go" | "error";
 
 type ApiResponse = {
   ok: boolean;
@@ -28,6 +28,7 @@ type ScanLog = {
 
 const STORAGE_OPERATOR_KEY = "barcode_scanner_operator";
 const DUPLICATE_BLOCK_MS = 3000;
+const GO_DISPLAY_MS = 1200;
 
 const ONE_D_FORMATS: BarcodeFormat[] = [
   BarcodeFormat.CODABAR,
@@ -86,8 +87,16 @@ function getCameraErrorMessage(error: unknown) {
 
 function vibrateSuccess() {
   if (typeof navigator !== "undefined" && "vibrate" in navigator) {
-    navigator.vibrate?.(80);
+    navigator.vibrate?.([60, 40, 60]);
   }
+}
+
+function getSaveStateLabel(saveState: SaveState) {
+  if (saveState === "idle") return "待機中";
+  if (saveState === "ready") return "読取OK";
+  if (saveState === "saving") return "保存中";
+  if (saveState === "go") return "GO";
+  return "エラー";
 }
 
 export default function BarcodeScanner() {
@@ -95,10 +104,13 @@ export default function BarcodeScanner() {
   const controlsRef = useRef<IScannerControls | null>(null);
   const readerRef = useRef<BrowserMultiFormatOneDReader | null>(null);
   const savingRef = useRef(false);
-  const lastScanRef = useRef<{ barcode: string; at: number } | null>(null);
+  const lastSavedScanRef = useRef<{ barcode: string; at: number } | null>(null);
+  const nextCameraReadAtRef = useRef(0);
+  const goTimeoutRef = useRef<number | null>(null);
 
   const [isScanning, setIsScanning] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [showGo, setShowGo] = useState(false);
   const [statusMessage, setStatusMessage] = useState("開始ボタンを押すとカメラが起動します。");
   const [errorMessage, setErrorMessage] = useState("");
   const [operator, setOperator] = useState("");
@@ -106,6 +118,28 @@ export default function BarcodeScanner() {
   const [lastReadAt, setLastReadAt] = useState("");
   const [logs, setLogs] = useState<ScanLog[]>([]);
   const [manualCode, setManualCode] = useState("");
+
+  const clearGoTimer = useCallback(() => {
+    if (goTimeoutRef.current) {
+      window.clearTimeout(goTimeoutRef.current);
+      goTimeoutRef.current = null;
+    }
+  }, []);
+
+  const showGoSignal = useCallback((message = "GO 次のバーコードへ") => {
+    clearGoTimer();
+    nextCameraReadAtRef.current = Date.now() + GO_DISPLAY_MS;
+    setShowGo(true);
+    setSaveState("go");
+    setStatusMessage(message);
+
+    goTimeoutRef.current = window.setTimeout(() => {
+      setShowGo(false);
+      setSaveState("ready");
+      setStatusMessage("読み取りできます。バーコードを枠の中央に水平に合わせてください。");
+      goTimeoutRef.current = null;
+    }, GO_DISPLAY_MS);
+  }, [clearGoTimer]);
 
   useEffect(() => {
     const savedOperator = window.localStorage.getItem(STORAGE_OPERATOR_KEY);
@@ -122,26 +156,34 @@ export default function BarcodeScanner() {
     } catch (error) {
       console.warn("Failed to stop scanner", error);
     } finally {
+      clearGoTimer();
       controlsRef.current = null;
       readerRef.current = null;
+      savingRef.current = false;
+      nextCameraReadAtRef.current = 0;
+      setShowGo(false);
       setIsScanning(false);
+      setSaveState("idle");
       setStatusMessage("スキャンを停止しました。");
     }
-  }, []);
+  }, [clearGoTimer]);
 
   useEffect(() => {
     return () => stopScanning();
   }, [stopScanning]);
 
   const submitScan = useCallback(
-    async (barcode: string, format: string) => {
+    async (barcode: string, format: string, options: { manual?: boolean } = {}) => {
       const normalizedBarcode = barcode.trim();
       if (!normalizedBarcode) return;
 
       const now = Date.now();
-      const lastScan = lastScanRef.current;
-      if (lastScan?.barcode === normalizedBarcode && now - lastScan.at < DUPLICATE_BLOCK_MS) {
+      if (!options.manual && now < nextCameraReadAtRef.current) return;
+
+      const lastSavedScan = lastSavedScanRef.current;
+      if (!options.manual && lastSavedScan?.barcode === normalizedBarcode && now - lastSavedScan.at < DUPLICATE_BLOCK_MS) {
         setStatusMessage("同じバーコードの連続送信を防止しました。別のコードを読むか、数秒待ってください。");
+        nextCameraReadAtRef.current = now + 800;
         return;
       }
 
@@ -150,15 +192,17 @@ export default function BarcodeScanner() {
         return;
       }
 
-      lastScanRef.current = { barcode: normalizedBarcode, at: now };
+      clearGoTimer();
+      setShowGo(false);
       savingRef.current = true;
+      nextCameraReadAtRef.current = now + 60_000;
 
       const readAt = new Date().toISOString();
       setLastBarcode(normalizedBarcode);
       setLastReadAt(readAt);
       setSaveState("saving");
       setErrorMessage("");
-      setStatusMessage(`読み取り成功: ${normalizedBarcode}。スプレッドシートへ保存中です。`);
+      setStatusMessage(`読み取り成功: ${normalizedBarcode}。保存中です。まだ次へ移らないでください。`);
 
       try {
         const response = await fetch("/api/scan", {
@@ -177,9 +221,9 @@ export default function BarcodeScanner() {
           throw new Error(data?.error ?? `保存APIでエラーが発生しました。HTTP ${response.status}`);
         }
 
+        lastSavedScanRef.current = { barcode: normalizedBarcode, at: Date.now() };
         vibrateSuccess();
-        setSaveState("saved");
-        setStatusMessage(`保存しました。行番号: ${data.row ?? "不明"}`);
+        showGoSignal("GO 次のバーコードへ");
         const nextLog: ScanLog = {
           barcode: normalizedBarcode,
           readAt,
@@ -188,29 +232,31 @@ export default function BarcodeScanner() {
           row: data.row,
           requestId: data.requestId,
         };
-        setLogs((prev) => [nextLog, ...prev].slice(0, 10));
+        setLogs((prev) => [nextLog, ...prev].slice(0, 20));
       } catch (error) {
         const message = error instanceof Error ? error.message : "保存に失敗しました。";
+        nextCameraReadAtRef.current = 0;
         setSaveState("error");
         setErrorMessage(message);
-        setStatusMessage("読み取りましたが、保存に失敗しました。通信状態と設定を確認してください。");
+        setStatusMessage("読み取りましたが、保存に失敗しました。エラー内容を確認してから再試行してください。");
         const nextLog: ScanLog = {
           barcode: normalizedBarcode,
           readAt,
           status: "error",
           message,
         };
-        setLogs((prev) => [nextLog, ...prev].slice(0, 10));
+        setLogs((prev) => [nextLog, ...prev].slice(0, 20));
       } finally {
         savingRef.current = false;
       }
     },
-    [operator],
+    [clearGoTimer, operator, showGoSignal],
   );
 
   const startScanning = useCallback(async () => {
     if (isScanning) return;
     setErrorMessage("");
+    setShowGo(false);
 
     if (!window.isSecureContext) {
       setErrorMessage("カメラ利用にはHTTPSが必要です。Vercel本番URL、またはlocalhostで開いてください。");
@@ -229,6 +275,7 @@ export default function BarcodeScanner() {
 
     try {
       setIsScanning(true);
+      setSaveState("ready");
       setStatusMessage("カメラを起動しています。権限ダイアログが出たら許可してください。");
 
       const hints = new Map();
@@ -236,8 +283,8 @@ export default function BarcodeScanner() {
       hints.set(DecodeHintType.TRY_HARDER, true);
 
       const reader = new BrowserMultiFormatOneDReader(hints, {
-        delayBetweenScanAttempts: 150,
-        delayBetweenScanSuccess: 1200,
+        delayBetweenScanAttempts: 120,
+        delayBetweenScanSuccess: 900,
         tryPlayVideoTimeout: 10000,
       });
       readerRef.current = reader;
@@ -267,6 +314,7 @@ export default function BarcodeScanner() {
       setStatusMessage("読み取りできます。バーコードを枠の中央に水平に合わせてください。");
     } catch (error) {
       setIsScanning(false);
+      setSaveState("idle");
       setErrorMessage(getCameraErrorMessage(error));
       setStatusMessage("カメラを起動できませんでした。");
     }
@@ -278,7 +326,7 @@ export default function BarcodeScanner() {
       const barcode = manualCode.trim();
       if (!barcode) return;
       setManualCode("");
-      await submitScan(barcode, "MANUAL");
+      await submitScan(barcode, "MANUAL", { manual: true });
     },
     [manualCode, submitScan],
   );
@@ -304,12 +352,20 @@ export default function BarcodeScanner() {
           </label>
         </div>
 
-        <div className="scanner-area" aria-label="バーコードスキャナー">
+        <div className={`scanner-area state-${saveState}`} aria-label="バーコードスキャナー">
           <video ref={videoRef} muted playsInline autoPlay />
           <div className="scan-frame" aria-hidden="true">
             <div className="scan-line" />
           </div>
-          <div className="status-bar">{statusMessage}</div>
+          {showGo && (
+            <div className="go-overlay" aria-live="assertive">
+              <strong>GO</strong>
+              <span>次のバーコードへ</span>
+            </div>
+          )}
+          <div className={`status-bar ${saveState}`} aria-live="polite">
+            {statusMessage}
+          </div>
         </div>
 
         <div className="controls">
@@ -324,7 +380,7 @@ export default function BarcodeScanner() {
         </div>
 
         <div className="result-panel">
-          <span className={`badge ${saveState}`}>{saveState === "idle" ? "待機中" : saveState === "saving" ? "保存中" : saveState === "saved" ? "保存済み" : "エラー"}</span>
+          <span className={`badge ${saveState}`}>{getSaveStateLabel(saveState)}</span>
           <div className="result-grid" style={{ marginTop: 12 }}>
             <span>直近コード</span>
             <strong>{lastBarcode || "-"}</strong>
@@ -369,8 +425,8 @@ export default function BarcodeScanner() {
         <div className="notice-panel">
           <h2>読み取りのコツ</h2>
           <ul>
+            <li>「保存中」の間はまだ次へ移らず、「GO」が出たら次のバーコードへ移ってください。</li>
             <li>バーコードを横向きにして、枠の中央に大きく入れてください。</li>
-            <li>暗い場所、反射、ピンぼけでは読み取りに時間がかかります。</li>
             <li>同じコードの連続送信は3秒間ブロックしています。</li>
           </ul>
         </div>
